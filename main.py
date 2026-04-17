@@ -1,4 +1,5 @@
 import os
+import unicodedata
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -20,6 +21,12 @@ TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
 TRAKT_CLIENT_SECRET = os.environ.get("TRAKT_CLIENT_SECRET", "")
 
 # --- Helper Functions for Matching ---
+
+def _strip_accents(text: str) -> str:
+    """Remove diacritical marks from a string for fuzzy comparison."""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
 
 def _verify_candidate(candidate, allocine_movie_data):
     """
@@ -48,8 +55,8 @@ def _verify_candidate(candidate, allocine_movie_data):
             return True # Year was verified
         else:
             # No year AND no directors - require exact title match for safety
-            allocine_title = allocine_movie_data.get('title', '').lower()
-            candidate_title = candidate.title.lower() if hasattr(candidate, 'title') else ''
+            allocine_title = _strip_accents(allocine_movie_data.get('title', '').lower().strip())
+            candidate_title = _strip_accents(candidate.title.lower().strip()) if hasattr(candidate, 'title') and candidate.title else ''
             # Accept if titles are very similar
             if allocine_title in candidate_title or candidate_title in allocine_title:
                 return True
@@ -66,22 +73,31 @@ def _verify_candidate(candidate, allocine_movie_data):
         if full_tm.people:
             # PyTrakt returns people as a flat list of Person objects
             for p in full_tm.people:
+                if p is None:
+                    continue
                 if hasattr(p, 'job') and p.job and p.job.lower() == 'director':
                     if hasattr(p, 'name') and p.name:
                         trakt_directors.append(p.name.lower())
         
         if not trakt_directors:
-            # Trakt has no director info, be lenient if year matched
-            return True
+            # Trakt has no director info -- require title similarity to avoid false positives
+            allocine_title = _strip_accents(allocine_movie_data.get('title', '').lower().strip())
+            original_title = _strip_accents(allocine_movie_data.get('original_title', '').lower().strip()) if allocine_movie_data.get('original_title') else ''
+            candidate_title = _strip_accents(candidate.title.lower().strip()) if hasattr(candidate, 'title') and candidate.title else ''
+            if (allocine_title and (allocine_title in candidate_title or candidate_title in allocine_title)) or \
+               (original_title and (original_title in candidate_title or candidate_title in original_title)):
+                return True
+            console.log(f"  [yellow]Rejecting '{candidate.title}': No director data on Trakt and title doesn't match closely enough[/yellow]")
+            return False
 
         for ad in allocine_directors:
-            ad_clean = ad.lower().strip()
+            ad_clean = _strip_accents(ad.lower().strip())
             # Extract last name (usually more reliable than first name/nicknames)
             ad_parts = ad_clean.split()
             ad_last_name = ad_parts[-1] if ad_parts else ad_clean
 
             for td in trakt_directors:
-                td_clean = td.strip()
+                td_clean = _strip_accents(td.strip())
                 td_parts = td_clean.split()
                 td_last_name = td_parts[-1] if td_parts else td_clean
 
@@ -94,8 +110,15 @@ def _verify_candidate(candidate, allocine_movie_data):
         return False
 
     except Exception as e:
-        console.log(f"  [bold red]Error verifying director for '{candidate.title}': {e}[/bold red]")
-        return False # Fail safe on error
+        console.log(f"  [yellow]Error verifying director for '{candidate.title}': {e}. Falling back to title match.[/yellow]")
+        # Director lookup failed (e.g. PyTrakt parsing error) -- fall back to title similarity
+        allocine_title = _strip_accents(allocine_movie_data.get('title', '').lower().strip())
+        original_title = _strip_accents(allocine_movie_data.get('original_title', '').lower().strip()) if allocine_movie_data.get('original_title') else ''
+        candidate_title = _strip_accents(candidate.title.lower().strip()) if hasattr(candidate, 'title') and candidate.title else ''
+        if (allocine_title and (allocine_title in candidate_title or candidate_title in allocine_title)) or \
+           (original_title and (original_title in candidate_title or candidate_title in original_title)):
+            return True
+        return False
 
 
 def _trakt_search_with_retry(search_fn, *args, **kwargs):
