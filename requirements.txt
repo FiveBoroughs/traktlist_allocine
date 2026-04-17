@@ -1,0 +1,5 @@
+typer
+beautifulsoup4
+requests
+rich
+PyTrakt

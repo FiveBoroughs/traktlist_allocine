@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytrakt.json
+.env
+*.html
+debug_*.py
+test_*.py
