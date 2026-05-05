@@ -28,6 +28,19 @@ def _strip_accents(text: str) -> str:
     return ''.join(c for c in nfkd if not unicodedata.combining(c))
 
 
+_TITLE_STOPWORDS = {'the', 'a', 'an', 'de', 'le', 'la', 'les', 'l', 'un', 'une', 'du'}
+
+def _titles_overlap(query: str, candidate: str) -> bool:
+    """True if query and candidate share enough tokens in both directions (prevents wrong-title matches)."""
+    q_tokens = set(_strip_accents(query.lower()).split()) - _TITLE_STOPWORDS
+    c_tokens = set(_strip_accents(candidate.lower()).split()) - _TITLE_STOPWORDS
+    if not q_tokens or not c_tokens:
+        return True
+    overlap = q_tokens & c_tokens
+    return (len(overlap) / len(q_tokens) >= 0.5 and
+            len(overlap) / len(c_tokens) >= 0.5)
+
+
 def _verify_candidate(candidate, allocine_movie_data):
     """
     Verifies a Trakt candidate against Allocine data using Year and Director.
@@ -103,7 +116,12 @@ def _verify_candidate(candidate, allocine_movie_data):
 
                 # Match if: full name substring match OR last names match
                 if ad_clean in td_clean or td_clean in ad_clean or ad_last_name == td_last_name:
-                    return True # Match found!
+                    return True
+                # Handle reversed name order (East Asian names) and accent edge cases
+                ad_tokens = frozenset(ad_clean.replace('-', ' ').split())
+                td_tokens = frozenset(td_clean.replace('-', ' ').split())
+                if ad_tokens == td_tokens:
+                    return True
 
         # If we checked all and found no match
         console.log(f"  [yellow]Rejecting '{candidate.title}' ({candidate.year}): Director mismatch. Allocine: {allocine_directors}, Trakt: {trakt_directors}[/yellow]")
@@ -150,8 +168,12 @@ def _search_and_verify(search_query: str, allocine_movie_data: Dict, search_type
         results = _trakt_search_with_retry(trakt.movies.Movie.search, search_query, year=allocine_movie_data['release_year'])
 
         for candidate in results:
-            if _verify_candidate(candidate, allocine_movie_data):
-                return candidate
+            if not _verify_candidate(candidate, allocine_movie_data):
+                continue
+            candidate_title = getattr(candidate, 'title', '') or ''
+            if not _titles_overlap(search_query, candidate_title):
+                continue
+            return candidate
 
     except Exception as e:
         console.log(f"  [red]Search error for '{search_query}' ({search_type}): {e}[/red]")
@@ -170,8 +192,12 @@ def _search_and_verify_series(search_query: str, allocine_series_data: Dict, sea
         results = _trakt_search_with_retry(trakt.tv.TVShow.search, search_query, year=allocine_series_data['release_year'])
 
         for candidate in results:
-            if _verify_candidate(candidate, allocine_series_data):
-                return candidate
+            if not _verify_candidate(candidate, allocine_series_data):
+                continue
+            candidate_title = getattr(candidate, 'title', '') or ''
+            if not _titles_overlap(search_query, candidate_title):
+                continue
+            return candidate
 
     except Exception as e:
         console.log(f"  [red]Search error for '{search_query}' ({search_type}): {e}[/red]")
@@ -193,8 +219,12 @@ def _search_by_wikidata(allocine_movie_data: Dict):
                 candidate = results[0]
                 # Check if it's a movie or TV show
                 if isinstance(candidate, trakt.movies.Movie) or isinstance(candidate, trakt.tv.TVShow):
-                    # Verify the candidate before accepting
-                    if _verify_candidate(candidate, allocine_movie_data):
+                    # IMDb ID is a precise identifier — only verify year, not director/title.
+                    # Director/title checks are redundant here and fail when Trakt has no crew data.
+                    if allocine_movie_data['release_year'] and candidate.year:
+                        if abs(candidate.year - int(allocine_movie_data['release_year'])) <= 1:
+                            return candidate
+                    else:
                         return candidate
         except Exception as e:
             console.log(f"  [red]Trakt search by IMDb ID failed for {imdb_id}: {e}[/red]")
