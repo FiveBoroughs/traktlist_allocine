@@ -1,3 +1,4 @@
+import time
 import requests
 from bs4 import BeautifulSoup
 from rich.console import Console
@@ -16,24 +17,32 @@ def get_imdb_id_from_wikidata(allocine_id: str) -> Optional[str]:
       OPTIONAL {{ ?item wdt:P345 ?imdbId. }}
     }}
     """
-    
-    # console.log(f"Querying Wikidata for Allocine ID: {allocine_id}")
-    
-    try:
-        # User-Agent is often required for Wikidata SPARQL to avoid 403
-        headers = {'User-Agent': 'TraktListAllocineBot/1.0 (test@example.com)'} 
-        response = requests.get(url, params={'query': query, 'format': 'json'}, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        
-        results = data.get('results', {}).get('bindings', [])
-        if results:
-            for result in results:
-                if 'imdbId' in result:
-                    return result['imdbId']['value']
-    except Exception as e:
-        console.log(f"[bold red]Wikidata query failed for {allocine_id}: {e}[/bold red]")
-        
+    headers = {'User-Agent': 'TraktListAllocineBot/1.0 (test@example.com)'}
+
+    for attempt in range(4):
+        try:
+            response = requests.get(url, params={'query': query, 'format': 'json'}, headers=headers, timeout=30)
+            if response.status_code == 429:
+                wait = 5 * 2 ** attempt  # 5, 10, 20, 40 seconds
+                console.log(f"[yellow]Wikidata rate limited, retrying in {wait}s...[/yellow]")
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            results = data.get('results', {}).get('bindings', [])
+            if results:
+                for result in results:
+                    if 'imdbId' in result:
+                        return result['imdbId']['value']
+            return None
+        except requests.exceptions.HTTPError as e:
+            console.log(f"[bold red]Wikidata query failed for {allocine_id}: {e}[/bold red]")
+            return None
+        except Exception as e:
+            console.log(f"[bold red]Wikidata query failed for {allocine_id}: {e}[/bold red]")
+            return None
+
+    console.log(f"[bold red]Wikidata rate limit not resolved after retries for {allocine_id}[/bold red]")
     return None
 
 def _get_movie_details_from_page(movie_url: str) -> Dict:
