@@ -1,17 +1,19 @@
 services:
   traktlist:
+    # Built and pushed by .github/workflows/docker.yml on every push to main.
+    # `docker compose pull` fetches it; `build` is only for local changes.
+    image: ghcr.io/fiveboroughs/traktlist_allocine:latest
     build:
       context: .
-      dockerfile_inline: |
-        FROM python:3.11-slim
-        WORKDIR /app
-        COPY requirements.txt .
-        RUN pip install --no-cache-dir -r requirements.txt
-        COPY allocine.py trakt_client.py main.py sync.sh ./
-        RUN chmod +x sync.sh
-        CMD ["bash", "sync.sh"]
+      dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      # Device-auth prints a code you must enter on trakt.tv/activate; without
+      # this it can sit in the stdout buffer while the container waits.
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./.pytrakt.json:/app/.pytrakt.json
+      # Published JSON lists - point your web server at this directory.
+      - ./lists:/app/lists
     restart: "no"
