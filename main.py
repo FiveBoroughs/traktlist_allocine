@@ -8,17 +8,27 @@ import trakt.tv
 from trakt.users import User
 import trakt.sync
 from types import SimpleNamespace
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
 
 from allocine import get_all_movies, get_allocine_list_title, get_imdb_id_from_wikidata
 from trakt_client import TraktClient
+from publishers import JsonPublisher, Publisher, PublishError, PublishResult, TmdbPublisher, slugify, tmdb_request, write_index
+from resolver import build_entries, fill_tmdb_ids, WikidataUnavailable
 
 console = Console()
 app = typer.Typer()
 
 TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
 TRAKT_CLIENT_SECRET = os.environ.get("TRAKT_CLIENT_SECRET", "")
+
+# TMDB_API_TOKEN is the app's "API Read Access Token"; the other two are
+# printed by `tmdb-login` and let us manage lists on the user's account.
+TMDB_API_TOKEN = os.environ.get("TMDB_API_TOKEN", "")
+TMDB_ACCESS_TOKEN = os.environ.get("TMDB_ACCESS_TOKEN", "")
+TMDB_ACCOUNT_ID = os.environ.get("TMDB_ACCOUNT_ID", "")
+
+PUBLISH_TARGETS = ('json', 'tmdb')
 
 # --- Helper Functions for Matching ---
 
@@ -279,6 +289,156 @@ def scrape_allocine(
         console.print(table)
     else:
         console.print("[bold yellow]No movies found or an error occurred during scraping.[/bold yellow]")
+
+def _publish_to(publisher: Publisher, list_key: str, list_name: str, description: str,
+                entries: List, force: bool) -> Optional[PublishResult]:
+    """Publishes to one target unless that would degrade what's already there; None if it didn't."""
+    label = publisher.name.upper()
+    usable, _ = publisher.usable_entries(entries)
+
+    # Count only what this target can publish: a title with a TMDb ID but no
+    # IMDb ID is useless to the JSON list, and would otherwise let a gutted
+    # list through.
+    if not usable:
+        console.print(f"[bold red]{label}: no title has {publisher.required_id()} set - refusing to publish an empty list.[/bold red]")
+        return None
+
+    try:
+        previous_count = publisher.published_count(list_key, list_name)
+    except PublishError as e:
+        console.print(f"[bold red]{label}: could not read the published list: {e}[/bold red]")
+        return None
+
+    if previous_count and len(usable) < previous_count * 0.5 and not force:
+        console.print(
+            f"[bold red]{label}: only {len(usable)} titles publishable, down from {previous_count} currently published. "
+            f"Refusing to shrink the list; re-run with --force if this is expected.[/bold red]"
+        )
+        return None
+
+    result = publisher.publish(list_key, list_name, description, entries)
+    if not result.ok:
+        console.print(f"[bold red]{label}: publishing failed: {result.error}[/bold red]")
+        return None
+
+    console.print(f"[bold green]{label}: published {result.published} titles to {result.location}[/bold green]")
+    if result.skipped:
+        console.print(f"[bold yellow]{label}: skipped {result.skipped}:[/bold yellow]")
+        for title in result.skipped_titles:
+            console.print(f"  [yellow]- {title}[/yellow]")
+    return result
+
+
+@app.command("publish")
+def publish(
+    allocine_url: str = typer.Argument(..., help="The Allocine list URL to scrape and publish."),
+    targets: List[str] = typer.Option(["json"], "--to", "-t", help=f"Where to publish: {', '.join(PUBLISH_TARGETS)}. Repeat for several."),
+    max_movies: int = typer.Option(25, "--max-movies", "-m", help="Maximum number of titles to publish. Defaults to 25."),
+    output_dir: str = typer.Option("lists", "--output-dir", "-o", help="Directory to write JSON lists into."),
+    list_slug: str = typer.Option(None, "--slug", "-s", help="Filename slug for the JSON list. Defaults to a slug of the Allocine list title."),
+    force: bool = typer.Option(False, "--force", help="Publish even if far fewer titles resolved than are currently published."),
+):
+    """
+    Scrapes an Allocine list and publishes it for Radarr, as a JSON file and/or a TMDb list.
+
+    Titles are identified by IDs resolved from Wikidata, so neither target
+    depends on Trakt. Each target is guarded and published independently.
+    """
+    unknown = [t for t in targets if t not in PUBLISH_TARGETS]
+    if unknown:
+        console.print(f"[bold red]Unknown target(s): {', '.join(unknown)}. Choose from {', '.join(PUBLISH_TARGETS)}.[/bold red]")
+        raise typer.Exit(code=2)
+    if 'tmdb' in targets and not (TMDB_API_TOKEN and TMDB_ACCESS_TOKEN and TMDB_ACCOUNT_ID):
+        console.print("[bold red]TMDb needs TMDB_API_TOKEN, TMDB_ACCESS_TOKEN and TMDB_ACCOUNT_ID - run `tmdb-login` first.[/bold red]")
+        raise typer.Exit(code=2)
+
+    allocine_list_title = get_allocine_list_title(allocine_url)
+    if not allocine_list_title:
+        console.print("[bold red]Could not extract list title from Allocine URL. Aborting.[/bold red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[bold blue]Publishing '{allocine_list_title}' from {allocine_url}[/bold blue]")
+
+    scraped = get_all_movies(allocine_url, max_movies)
+    if not scraped:
+        console.print("[bold yellow]No titles scraped. Aborting.[/bold yellow]")
+        raise typer.Exit(code=1)
+
+    try:
+        entries = build_entries(scraped)
+    except WikidataUnavailable as e:
+        console.print(f"[bold red]ID resolution unavailable: {e}[/bold red]")
+        console.print("[bold yellow]Leaving the published lists untouched.[/bold yellow]")
+        raise typer.Exit(code=1)
+
+    if 'tmdb' in targets:
+        filled = fill_tmdb_ids(entries, TMDB_API_TOKEN)
+        if filled:
+            console.print(f"[green]Found {filled} more TMDb IDs from IMDb IDs[/green]")
+
+    resolved = [e for e in entries if e.has_any_id()]
+    console.print(f"[bold green]Scraped {len(scraped)} titles, resolved external IDs for {len(resolved)}[/bold green]")
+
+    list_key = list_slug or slugify(allocine_list_title)
+    list_name = f"Allocine - {allocine_list_title}"
+    # No URL: TMDb rejects list descriptions containing links ("blocked words").
+    description = f"{allocine_list_title}, synced daily from Allociné"
+
+    failed = False
+    for target in dict.fromkeys(targets):
+        if target == 'json':
+            publisher = JsonPublisher(output_dir)
+        else:
+            publisher = TmdbPublisher(TMDB_ACCESS_TOKEN, TMDB_ACCOUNT_ID)
+
+        result = _publish_to(publisher, list_key, list_name, description, entries, force)
+        if not result:
+            failed = True
+            continue
+
+        if target == 'json':
+            index_path = write_index(output_dir, [{
+                'name': list_name,
+                'slug': list_key,
+                'source': allocine_url,
+                'count': result.published,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+                'file': f'{list_key}.json',
+            }])
+            console.print(f"[bold green]Updated index at {index_path}[/bold green]")
+
+    if failed:
+        raise typer.Exit(code=1)
+
+
+@app.command("tmdb-login")
+def tmdb_login():
+    """
+    Authorizes this tool to manage lists on your TMDb account.
+
+    Needs TMDB_API_TOKEN, the "API Read Access Token" from
+    https://www.themoviedb.org/settings/api. Prints the TMDB_ACCESS_TOKEN and
+    TMDB_ACCOUNT_ID lines to add to .env.
+    """
+    if not TMDB_API_TOKEN:
+        console.print("[bold red]Set TMDB_API_TOKEN (API Read Access Token from https://www.themoviedb.org/settings/api) first.[/bold red]")
+        raise typer.Exit(code=2)
+
+    try:
+        request_token = tmdb_request(TMDB_API_TOKEN, 'POST', '/4/auth/request_token', json={})['request_token']
+        console.print("[bold yellow]Approve access in your browser (while logged in to TMDb):[/bold yellow]")
+        # Plain print: rich would fold the long token across lines and break the URL.
+        print(f"https://www.themoviedb.org/auth/access?request_token={request_token}")
+        typer.prompt("Press Enter once approved", default="", show_default=False)
+        granted = tmdb_request(TMDB_API_TOKEN, 'POST', '/4/auth/access_token', json={'request_token': request_token})
+    except PublishError as e:
+        console.print(f"[bold red]TMDb authorization failed: {e}[/bold red]")
+        raise typer.Exit(code=1)
+
+    console.print("[bold green]Authorized. Add these lines to .env:[/bold green]")
+    print(f"TMDB_ACCESS_TOKEN={granted['access_token']}")
+    print(f"TMDB_ACCOUNT_ID={granted['account_id']}")
+
 
 @app.command("sync-to-trakt")
 def sync_to_trakt(

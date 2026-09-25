@@ -14,16 +14,93 @@ class TraktClient:
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
         self.client_secret = client_secret
-        trakt.CLIENT_ID = client_id
-        trakt.CLIENT_SECRET = client_secret
-        trakt.core.AUTH_METHOD = trakt.core.DEVICE_AUTH
-        trakt.core.session.headers['User-Agent'] = 'pytrakt/4.2.2'
 
         # Set config path to current directory to ensure persistence visibility
         self.config_path = os.path.join(os.getcwd(), ".pytrakt.json")
         trakt.core.CONFIG_PATH = self.config_path
-        
+
+        # PyTrakt re-exports these from trakt.core, so assigning them on the
+        # `trakt` namespace alone would leave trakt.core untouched.
+        trakt.core.CLIENT_ID = trakt.CLIENT_ID = client_id
+        trakt.core.CLIENT_SECRET = trakt.CLIENT_SECRET = client_secret
+        trakt.core.AUTH_METHOD = trakt.core.DEVICE_AUTH
+        trakt.core.session.headers['User-Agent'] = 'pytrakt/4.2.2'
+
+        self._load_stored_tokens()
+        self._reset_trakt_caches()
+
         self.authenticated_username = None
+
+    def _read_config(self) -> Dict:
+        """Reads PyTrakt's config file, returning an empty dict if unusable."""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, 'r') as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                pass
+        return {}
+
+    @staticmethod
+    def _reset_trakt_caches():
+        """Drops PyTrakt's cached config/client so module globals take effect."""
+        trakt.core.config.cache_clear()
+        trakt.core.api.cache_clear()
+
+    def _load_stored_tokens(self):
+        """
+        Feeds stored OAuth tokens to PyTrakt.
+
+        PyTrakt only reads its config file when the client credentials are
+        unset, so with credentials coming from the environment the stored
+        tokens would otherwise be ignored. Tokens belonging to a different
+        Trakt application are dropped instead of being reused.
+        """
+        stored = self._read_config()
+        if stored.get('CLIENT_ID') != self.client_id:
+            if stored:
+                console.print("[bold yellow]Stored tokens belong to a different Trakt application - ignoring them.[/bold yellow]")
+            return
+
+        trakt.core.OAUTH_TOKEN = stored.get('OAUTH_TOKEN')
+        trakt.core.OAUTH_REFRESH = stored.get('OAUTH_REFRESH')
+        trakt.core.OAUTH_EXPIRES_AT = stored.get('OAUTH_EXPIRES_AT')
+
+    def _clear_stored_tokens(self):
+        """
+        Forgets the stored OAuth tokens, in memory and on disk.
+
+        A refresh token Trakt no longer recognises makes PyTrakt fail on the
+        refresh attempt before it ever asks for a device code, so the dead
+        tokens have to go before a fresh device auth can run.
+        """
+        trakt.core.OAUTH_TOKEN = None
+        trakt.core.OAUTH_REFRESH = None
+        trakt.core.OAUTH_EXPIRES_AT = None
+        self._reset_trakt_caches()
+
+        config = self._read_config()
+        if not config:
+            return
+        for key in ('OAUTH_TOKEN', 'OAUTH_REFRESH', 'OAUTH_EXPIRES_AT'):
+            config.pop(key, None)
+        try:
+            with open(self.config_path, 'w') as f:
+                json.dump(config, f)
+        except OSError as e:
+            console.print(f"[bold yellow]Warning: could not clear stored tokens in {self.config_path}: {e}[/bold yellow]")
+
+    def _client_credentials_rejected(self) -> bool:
+        """Asks Trakt whether the configured application still exists."""
+        try:
+            response = requests.post(
+                'https://api.trakt.tv/oauth/device/code',
+                json={'client_id': self.client_id},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException:
+            return False
+        return response.status_code == 401 and 'invalid_client' in response.text
 
     def authenticate(self):
         """
@@ -31,22 +108,30 @@ class TraktClient:
         Only triggers interactive auth if necessary.
         """
         console.print("[bold yellow]Checking authentication status...[/bold yellow]")
-        
+
         try:
             me = User('me')
             self.authenticated_username = me.username
             console.print(f"[bold green]Authenticated as '{self.authenticated_username}' using stored credentials.[/bold green]")
-            return 
+            return
         except Exception:
             console.print("[bold yellow]Stored credentials missing or invalid. Starting device authentication...[/bold yellow]")
+
+        self._clear_stored_tokens()
 
         try:
             trakt.init(client_id=self.client_id, client_secret=self.client_secret, store=True)
             self.authenticated_username = User('me').username
             console.print("[bold green]Trakt.tv authentication successful![/bold green]")
-            
+
         except Exception as e:
             console.print(f"[bold red]Trakt.tv authentication failed: {e}[/bold red]")
+            if self._client_credentials_rejected():
+                console.print(
+                    "[bold red]Trakt does not recognise TRAKT_CLIENT_ID - the API application was deleted or the "
+                    "credentials are wrong.\nCreate a new application at https://trakt.tv/oauth/applications "
+                    "(redirect URI: urn:ietf:wg:oauth:2.0:oob) and put its client id/secret in .env.[/bold red]"
+                )
             raise
 
     def _get_access_token(self) -> Optional[str]:
