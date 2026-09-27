@@ -12,7 +12,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 from rich.console import Console
@@ -20,6 +20,7 @@ from rich.console import Console
 console = Console()
 
 TMDB_API = 'https://api.themoviedb.org'
+MDBLIST_API = 'https://api.mdblist.com'
 
 
 class PublishError(RuntimeError):
@@ -69,30 +70,43 @@ def slugify(text: str) -> str:
     return slug or 'allocine-list'
 
 
-def tmdb_request(token: str, method: str, path: str, **kwargs) -> Dict:
-    """Calls the TMDb API with a bearer token, raising PublishError on failure."""
+def _api_request(service: str, method: str, base: str, path: str, secret: str = '', **kwargs) -> Any:
+    """
+    Calls a JSON API, raising PublishError with the service's reason on failure.
+
+    ``secret`` is scrubbed from error text: a key sent as a query parameter
+    ends up in requests' connection error messages, and those reach cron mail.
+    """
     try:
-        response = requests.request(
-            method,
-            f'{TMDB_API}{path}',
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json;charset=utf-8'},
-            timeout=30,
-            **kwargs,
-        )
+        response = requests.request(method, f'{base}{path}', timeout=30, **kwargs)
     except requests.exceptions.RequestException as e:
-        raise PublishError(f'TMDb {method} {path} failed: {e}') from e
+        reason = str(e).replace(secret, '***') if secret else e
+        raise PublishError(f'{service} {method} {path} failed: {reason}') from None
 
     try:
         body = response.json()
     except ValueError:
         body = {}
     if not response.ok:
-        message = body.get('status_message') or response.text[:200]
-        # Validation failures only say why in `errors`.
-        if body.get('errors'):
-            message = f"{message} {'; '.join(map(str, body['errors']))}"
-        raise PublishError(f'TMDb {method} {path} returned HTTP {response.status_code}: {message}')
+        details = body if isinstance(body, dict) else {}
+        message = details.get('status_message') or details.get('error') or details.get('detail') or response.text[:200]
+        # TMDb validation failures only say why in `errors`.
+        if details.get('errors'):
+            message = f"{message} {'; '.join(map(str, details['errors']))}"
+        raise PublishError(f'{service} {method} {path} returned HTTP {response.status_code}: {message}')
     return body
+
+
+def tmdb_request(token: str, method: str, path: str, **kwargs) -> Dict:
+    """Calls the TMDb API with a bearer token, raising PublishError on failure."""
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json;charset=utf-8'}
+    return _api_request('TMDb', method, TMDB_API, path, headers=headers, **kwargs)
+
+
+def mdblist_request(api_key: str, method: str, path: str, params: Optional[Dict] = None, **kwargs) -> Any:
+    """Calls the MDBList API with an API key, raising PublishError on failure."""
+    return _api_request('MDBList', method, MDBLIST_API, path, secret=api_key,
+                        params={**(params or {}), 'apikey': api_key}, **kwargs)
 
 
 class Publisher(ABC):
@@ -275,6 +289,108 @@ class TmdbPublisher(Publisher):
         result.skipped += len(rejected)
         result.skipped_titles += [f"{wanted.get(tmdb_id, tmdb_id)} (TMDb rejected ID {tmdb_id})" for tmdb_id in rejected]
         result.location = f'https://www.themoviedb.org/list/{list_id}'
+        return result
+
+
+class MdblistPublisher(Publisher):
+    """
+    Keeps a public MDBList static list in sync, for Radarr's "Custom Lists" import.
+
+    Unlike TMDb, MDBList lists are searchable, so other *arr users can find
+    them. Radarr takes the list's page URL. Same lifecycle as TmdbPublisher:
+    found by name, created on first publish, then only diffs are sent.
+    """
+
+    name = 'mdblist'
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def required_id(self) -> str:
+        return 'tmdb_id'
+
+    def _call(self, method: str, path: str, **kwargs) -> Any:
+        return mdblist_request(self.api_key, method, path, **kwargs)
+
+    def find_list(self, list_name: str) -> Optional[Dict]:
+        for mdb_list in self._call('GET', '/lists/user'):
+            if mdb_list.get('name') == list_name:
+                return mdb_list
+        return None
+
+    def published_count(self, list_key: str, list_name: str) -> int:
+        mdb_list = self.find_list(list_name)
+        return mdb_list.get('items', 0) if mdb_list else 0
+
+    def _movie_ids(self, list_id: int) -> Set[int]:
+        ids: Set[int] = set()
+        params: Dict = {'mediatype': 'movie', 'limit': 1000}
+        while True:
+            body = self._call('GET', f'/lists/{list_id}/items', params=params)
+            ids.update(m['ids']['tmdb'] for m in body.get('movies', []) if m.get('ids', {}).get('tmdb'))
+            cursor = (body.get('pagination') or {}).get('next_cursor')
+            if not cursor:
+                return ids
+            params = {**params, 'cursor': cursor}
+
+    def publish(self, list_key: str, list_name: str, description: str,
+                entries: List[ListEntry]) -> PublishResult:
+        usable, unusable = self.usable_entries(entries)
+        result = PublishResult(
+            target=self.name,
+            skipped=len(unusable),
+            skipped_titles=[e.title for e in unusable],
+        )
+
+        wanted: Dict[int, ListEntry] = {}
+        for entry in usable:
+            wanted.setdefault(entry.tmdb_id, entry)
+
+        def payload(tmdb_ids):
+            movies = []
+            for tmdb_id in tmdb_ids:
+                item: Dict = {'tmdb': tmdb_id}
+                if tmdb_id in wanted and wanted[tmdb_id].imdb_id:
+                    item['imdb'] = wanted[tmdb_id].imdb_id
+                movies.append(item)
+            return {'movies': movies}
+
+        try:
+            mdb_list = self.find_list(list_name)
+            if mdb_list:
+                list_id = mdb_list['id']
+                current = self._movie_ids(list_id)
+            else:
+                list_id = self._call('POST', '/lists/user/add', json={'name': list_name, 'private': False})['id']
+                current = set()
+
+            to_add = [tmdb_id for tmdb_id in wanted if tmdb_id not in current]
+            to_remove = [tmdb_id for tmdb_id in current if tmdb_id not in wanted]
+
+            not_found = 0
+            if to_add:
+                body = self._call('POST', f'/lists/{list_id}/items/add', json=payload(to_add))
+                not_found = (body.get('not_found') or {}).get('movies', 0)
+            # Add before remove, as in TmdbPublisher.
+            if to_remove:
+                self._call('POST', f'/lists/{list_id}/items/remove', json=payload(to_remove))
+
+            # The add response only counts misses, so re-read to name them.
+            rejected: List[int] = []
+            if not_found:
+                listed = self._movie_ids(list_id)
+                rejected = [tmdb_id for tmdb_id in wanted if tmdb_id not in listed]
+            # Returned as a one-element array, despite the schema.
+            info = self._call('GET', f'/lists/{list_id}')[0]
+        except PublishError as e:
+            result.error = str(e)
+            return result
+
+        console.print(f"[dim]MDBList list {list_id}: +{len(to_add) - len(rejected)} -{len(to_remove)}[/dim]")
+        result.published = len(wanted) - len(rejected)
+        result.skipped += len(rejected)
+        result.skipped_titles += [f"{wanted[tmdb_id].title} (MDBList does not know TMDb ID {tmdb_id})" for tmdb_id in rejected]
+        result.location = f"https://mdblist.com/lists/{info['user_name']}/{info['slug']}"
         return result
 
 

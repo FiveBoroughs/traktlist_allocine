@@ -13,11 +13,12 @@ from datetime import datetime, timezone
 
 from allocine import get_all_movies, get_allocine_list_title, get_imdb_id_from_wikidata
 from trakt_client import TraktClient
-from publishers import JsonPublisher, Publisher, PublishError, PublishResult, TmdbPublisher, slugify, tmdb_request, write_index
+from publishers import JsonPublisher, MdblistPublisher, Publisher, PublishError, PublishResult, TmdbPublisher, slugify, tmdb_request, write_index
 from resolver import build_entries, fill_tmdb_ids, WikidataUnavailable
 
 console = Console()
-app = typer.Typer()
+# Locals would include API keys, and tracebacks end up in cron mail.
+app = typer.Typer(pretty_exceptions_show_locals=False)
 
 TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
 TRAKT_CLIENT_SECRET = os.environ.get("TRAKT_CLIENT_SECRET", "")
@@ -28,7 +29,9 @@ TMDB_API_TOKEN = os.environ.get("TMDB_API_TOKEN", "")
 TMDB_ACCESS_TOKEN = os.environ.get("TMDB_ACCESS_TOKEN", "")
 TMDB_ACCOUNT_ID = os.environ.get("TMDB_ACCOUNT_ID", "")
 
-PUBLISH_TARGETS = ('json', 'tmdb')
+MDBLIST_API_KEY = os.environ.get("MDBLIST_API_KEY", "")
+
+PUBLISH_TARGETS = ('json', 'tmdb', 'mdblist')
 
 # --- Helper Functions for Matching ---
 
@@ -339,10 +342,10 @@ def publish(
     force: bool = typer.Option(False, "--force", help="Publish even if far fewer titles resolved than are currently published."),
 ):
     """
-    Scrapes an Allocine list and publishes it for Radarr, as a JSON file and/or a TMDb list.
+    Scrapes an Allocine list and publishes it for Radarr, as a JSON file, a TMDb list and/or an MDBList list.
 
-    Titles are identified by IDs resolved from Wikidata, so neither target
-    depends on Trakt. Each target is guarded and published independently.
+    Titles are identified by IDs resolved from Wikidata, so no target depends
+    on Trakt. Each target is guarded and published independently.
     """
     unknown = [t for t in targets if t not in PUBLISH_TARGETS]
     if unknown:
@@ -350,6 +353,9 @@ def publish(
         raise typer.Exit(code=2)
     if 'tmdb' in targets and not (TMDB_API_TOKEN and TMDB_ACCESS_TOKEN and TMDB_ACCOUNT_ID):
         console.print("[bold red]TMDb needs TMDB_API_TOKEN, TMDB_ACCESS_TOKEN and TMDB_ACCOUNT_ID - run `tmdb-login` first.[/bold red]")
+        raise typer.Exit(code=2)
+    if 'mdblist' in targets and not MDBLIST_API_KEY:
+        console.print("[bold red]MDBList needs MDBLIST_API_KEY (from https://mdblist.com/preferences).[/bold red]")
         raise typer.Exit(code=2)
 
     allocine_list_title = get_allocine_list_title(allocine_url)
@@ -371,7 +377,8 @@ def publish(
         console.print("[bold yellow]Leaving the published lists untouched.[/bold yellow]")
         raise typer.Exit(code=1)
 
-    if 'tmdb' in targets:
+    # Both list services identify films by TMDb ID; Wikidata sometimes only has the IMDb ID.
+    if TMDB_API_TOKEN and ('tmdb' in targets or 'mdblist' in targets):
         filled = fill_tmdb_ids(entries, TMDB_API_TOKEN)
         if filled:
             console.print(f"[green]Found {filled} more TMDb IDs from IMDb IDs[/green]")
@@ -388,8 +395,10 @@ def publish(
     for target in dict.fromkeys(targets):
         if target == 'json':
             publisher = JsonPublisher(output_dir)
-        else:
+        elif target == 'tmdb':
             publisher = TmdbPublisher(TMDB_ACCESS_TOKEN, TMDB_ACCOUNT_ID)
+        else:
+            publisher = MdblistPublisher(MDBLIST_API_KEY)
 
         result = _publish_to(publisher, list_key, list_name, description, entries, force)
         if not result:

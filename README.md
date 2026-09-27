@@ -2,15 +2,23 @@
 
 Scrapes movie lists from [Allocine.fr](https://www.allocine.fr) and publishes them as lists that Radarr can subscribe to, so French \*arr users can follow the Allocine box office without adding films by hand.
 
-Three publishing channels:
+Four publishing channels:
 
 | Channel | Radarr import list | Needs | Status |
 | --- | --- | --- | --- |
+| MDBList list | Custom Lists | free MDBList account | primary, searchable |
 | TMDb list | TMDb List | free TMDb account | primary |
 | JSON list | StevenLu Custom | a web server to serve `lists/` | primary |
 | Trakt list | Trakt List | Trakt OAuth app (VIP-only since August 2026) | optional |
 
-Titles are identified by IMDb/TMDb IDs resolved from Wikidata, so the TMDb and JSON channels keep working when Trakt does not.
+Titles are identified by IMDb/TMDb IDs resolved from Wikidata, so the MDBList, TMDb and JSON channels keep working when Trakt does not.
+
+Published lists:
+
+| Allocine list | MDBList (Radarr Custom Lists URL) | TMDb List ID |
+| --- | --- | --- |
+| Films à l'affiche | https://mdblist.com/lists/vehhka9s/allocine-films-a-laffiche | 8699897 |
+| Films à venir les plus consultés | https://mdblist.com/lists/vehhka9s/allocine-films-a-venir-les-plus-consultes | 8699898 |
 
 ## Publishing
 
@@ -18,17 +26,22 @@ Titles are identified by IMDb/TMDb IDs resolved from Wikidata, so the TMDb and J
 # JSON only (default)
 python main.py publish https://www.allocine.fr/film/aucinema/ --max-movies 25 --output-dir lists
 
-# JSON and TMDb
-python main.py publish https://www.allocine.fr/film/aucinema/ --to json --to tmdb
+# JSON, TMDb and MDBList
+python main.py publish https://www.allocine.fr/film/aucinema/ --to json --to tmdb --to mdblist
 ```
 
-### TMDb list
+### MDBList and TMDb lists
 
-On first publish a public list named `Allocine - <list title>` is created on your TMDb account; later runs find it by name and only add or remove the titles that changed. Don't rename it on TMDb, or the next run will create a new one.
+On first publish a public list named `Allocine - <list title>` is created on the account; later runs find it by name and only add or remove the titles that changed. Don't rename it, or the next run will create a new one.
 
-Titles need a TMDb ID. Wikidata supplies most of them; for the rest the TMDb ID is looked up from the IMDb ID.
+Titles need a TMDb ID. Wikidata supplies most of them; for the rest the TMDb ID is looked up from the IMDb ID (needs `TMDB_API_TOKEN`).
 
-In Radarr: Settings → Import Lists → Add → **TMDb List**, and enter the list's numeric ID (the number in `https://www.themoviedb.org/list/<id>`, printed at the end of each run).
+MDBList lists show up in MDBList's list search, so other users can find them. TMDb has no list search: share the ID or URL.
+
+In Radarr:
+
+- MDBList: Settings → Import Lists → Add → **Custom Lists**, List URL `https://mdblist.com/lists/<user>/<slug>` (printed at the end of each run)
+- TMDb: Settings → Import Lists → Add → **TMDb List**, and enter the list's numeric ID (the number in `https://www.themoviedb.org/list/<id>`, printed at the end of each run)
 
 ### JSON list
 
@@ -40,12 +53,12 @@ Radarr identifies titles by `imdb_id`; the `title`, `year`, and `allocine_id` fi
 
 ### Safety guards
 
-Each channel is checked separately, counting only the titles it can publish (an IMDb ID for JSON, a TMDb ID for TMDb):
+Each channel is checked separately, counting only the titles it can publish (an IMDb ID for JSON, a TMDb ID for TMDb and MDBList):
 
 - if no title has the ID that channel needs, nothing is written
 - if fewer than half as many titles are publishable as are currently published, that channel is skipped (override with `--force`)
 
-A skipped channel leaves its list untouched and makes the run exit non-zero, but the other channel still publishes. A Wikidata outage leaves every list untouched.
+A skipped channel leaves its list untouched and makes the run exit non-zero, but the other channels still publish. A Wikidata outage leaves every list untouched.
 
 ## Setup
 
@@ -57,6 +70,13 @@ A skipped channel leaves its list untouched and makes the run exit non-zero, but
 4. Add the printed `TMDB_ACCESS_TOKEN` and `TMDB_ACCOUNT_ID` lines to `.env`
 
 With `TMDB_ACCESS_TOKEN` set, `sync.sh` publishes to TMDb as well as JSON.
+
+### MDBList credentials
+
+1. Log in at https://mdblist.com and copy the API key from https://mdblist.com/preferences
+2. Put it in `.env` as `MDBLIST_API_KEY`
+
+With `MDBLIST_API_KEY` set, `sync.sh` publishes to MDBList too. The free tier allows 4 static lists and 1,000 API requests a day; a nightly run of both lists uses about a dozen.
 
 ### Trakt API credentials (optional)
 
@@ -81,6 +101,7 @@ Add your credentials to `.env`:
 TMDB_API_TOKEN=your_api_read_access_token
 TMDB_ACCESS_TOKEN=printed_by_tmdb_login
 TMDB_ACCOUNT_ID=printed_by_tmdb_login
+MDBLIST_API_KEY=your_mdblist_api_key
 TRAKT_CLIENT_ID=your_client_id
 TRAKT_CLIENT_SECRET=your_client_secret
 ```

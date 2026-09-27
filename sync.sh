@@ -12,11 +12,14 @@ LISTS=(
   "https://www.allocine.fr/film/attendus/"
 )
 
-# JSON and TMDb lists are the primary channels: resolved from Wikidata, no
-# Trakt account involved. Publish them first so a broken Trakt never blocks them.
+# JSON, TMDb and MDBList lists are the primary channels: resolved from Wikidata,
+# no Trakt account involved. Publish them first so a broken Trakt never blocks them.
 TARGETS=(--to json)
 if [ -n "$TMDB_ACCESS_TOKEN" ]; then
   TARGETS+=(--to tmdb)
+fi
+if [ -n "$MDBLIST_API_KEY" ]; then
+  TARGETS+=(--to mdblist)
 fi
 
 # One list failing its guards must not stop the others from updating.
