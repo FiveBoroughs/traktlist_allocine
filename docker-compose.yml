@@ -9,11 +9,13 @@ services:
     env_file:
       - .env
     environment:
-      # Device-auth prints a code you must enter on trakt.tv/activate; without
-      # this it can sit in the stdout buffer while the container waits.
+      # Schedule in the NAS timezone. The container stays running between runs.
+      TZ: Europe/Paris
+      SYNC_TIME: "00:00"
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./.pytrakt.json:/app/.pytrakt.json
       # Published JSON lists - point your web server at this directory.
       - ./lists:/app/lists
-    restart: "no"
+    restart: unless-stopped
+    stop_grace_period: 1m

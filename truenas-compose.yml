@@ -1,0 +1,17 @@
+# Install as a TrueNAS Custom App (Install via YAML). The image runs its own
+# daily scheduler; no TrueNAS cron job or Docker socket is needed.
+services:
+  traktlist:
+    image: ghcr.io/fiveboroughs/traktlist_allocine:latest
+    pull_policy: always
+    env_file:
+      - /mnt/Octopus/appConfigs/traktlist_allocine/.env
+    environment:
+      TZ: Europe/Paris
+      SYNC_TIME: "00:00"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - /mnt/Octopus/appConfigs/traktlist_allocine/.pytrakt.json:/app/.pytrakt.json
+      - /mnt/Octopus/appConfigs/traktlist_allocine/lists:/app/lists
+    restart: unless-stopped
+    stop_grace_period: 1m

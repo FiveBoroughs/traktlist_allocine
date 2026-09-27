@@ -106,23 +106,23 @@ TRAKT_CLIENT_ID=your_client_id
 TRAKT_CLIENT_SECRET=your_client_secret
 ```
 
-### Run with Docker
+### Run continuously with Docker
 
-Every push to `main` builds `ghcr.io/fiveboroughs/traktlist_allocine:latest`. To run it you only need `docker-compose.yml`, `.env` and (for Trakt) `.pytrakt.json` in one directory:
-
-```bash
-docker compose pull && docker compose run --rm traktlist
-```
-
-To run local code changes instead, build from the checkout: `docker compose run --build --rm traktlist`.
-
-If Trakt is configured, on first run you'll be prompted to authenticate with Trakt via device code. The OAuth token is persisted in `.pytrakt.json`.
-
-### Cron
+Every push to `main` builds `ghcr.io/fiveboroughs/traktlist_allocine:latest`. The container stays running but idle between daily runs; `SYNC_TIME` defaults to `00:00` and the Compose file sets `TZ=Europe/Paris`. It waits until the next scheduled time on startup (it does not replay a missed run). A failed sync is logged and the next day's run is still scheduled.
 
 ```bash
-docker compose -f /path/to/docker-compose.yml pull && docker compose -f /path/to/docker-compose.yml run --rm traktlist >> /path/to/sync.log 2>&1
+docker compose pull
+docker compose up -d --no-build
+docker compose logs -f traktlist
 ```
+
+To use local code changes, run `docker compose up -d --build`. To trigger one sync immediately without waiting for midnight, use `docker compose run --rm traktlist bash sync.sh`.
+
+### TrueNAS Custom App
+
+In **Apps → Discover Apps → Custom App → Install via YAML**, use `truenas-compose.yml`. It refers to `/mnt/Octopus/appConfigs/traktlist_allocine/.env`, `.pytrakt.json` and `lists/`; change these absolute paths for another NAS. The app must stay **Running** for TrueNAS to manage container-image updates. When a new GHCR image is available, update/redeploy the app in TrueNAS; `pull_policy: always` fetches the current `latest` tag. No TrueNAS cron job is needed.
+
+The scheduled time and timezone can be changed with `SYNC_TIME: "HH:MM"` and `TZ` in the app YAML. Logs are available in the TrueNAS app UI. If Trakt is configured, its first device authentication requires an interactive one-off run; the OAuth token persists in `.pytrakt.json`.
 
 ## Usage
 
