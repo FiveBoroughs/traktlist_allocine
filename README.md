@@ -17,8 +17,8 @@ Published lists:
 
 | Allocine list | MDBList (Radarr Custom Lists URL) | TMDb List ID |
 | --- | --- | --- |
-| Films à l'affiche | https://mdblist.com/lists/vehhka9s/allocine-films-a-laffiche | 8699897 |
-| Films à venir les plus consultés | https://mdblist.com/lists/vehhka9s/allocine-films-a-venir-les-plus-consultes | 8699898 |
+| Films à l'affiche | https://mdblist.com/lists/allocine/allocine-films-a-laffiche | 8699897 |
+| Films à venir les plus consultés | https://mdblist.com/lists/allocine/allocine-films-a-venir-les-plus-consultes | 8699898 |
 
 ## Publishing
 
